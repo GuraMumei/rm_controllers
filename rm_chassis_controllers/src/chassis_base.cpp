@@ -56,7 +56,6 @@ bool ChassisBase<T...>::init(hardware_interface::RobotHW* robot_hw, ros::NodeHan
       !controller_nh.getParam("power/vel_coeff", velocity_coeff_) ||
       !controller_nh.getParam("power/effort_coeff", effort_coeff_) ||
       !controller_nh.getParam("power/power_offset", power_offset_))
-
   {
     ROS_ERROR("Some chassis params doesn't given (namespace: %s)", controller_nh.getNamespace().c_str());
     return false;
@@ -66,7 +65,7 @@ bool ChassisBase<T...>::init(hardware_interface::RobotHW* robot_hw, ros::NodeHan
   max_odom_vel_ = getParam(controller_nh, "max_odom_vel", 0);
   enable_odom_tf_ = getParam(controller_nh, "enable_odom_tf", true);
   publish_odom_tf_ = getParam(controller_nh, "publish_odom_tf", false);
-  enable_path_ = getParam(controller_nh, "enable_path", false);
+  enable_map_tf_ = getParam(controller_nh, "enable_map_tf", true);
 
   // Get and check params for covariances
   XmlRpc::XmlRpcValue twist_cov_list;
@@ -93,6 +92,22 @@ bool ChassisBase<T...>::init(hardware_interface::RobotHW* robot_hw, ros::NodeHan
   ramp_x_ = new RampFilter<double>(0, 0.001);
   ramp_y_ = new RampFilter<double>(0, 0.001);
   ramp_w_ = new RampFilter<double>(0, 0.001);
+  // init map tf
+  if (enable_map_tf_)
+  {
+    map2odom_.header.frame_id = "map";
+    map2odom_.header.stamp = ros::Time::now();
+    map2odom_.child_frame_id = "odom";
+    map2odom_.transform.rotation.w = 1;
+    tf_broadcaster_map2odom_.init(root_nh);
+    tf_broadcaster_map2odom_.sendTransform(map2odom_);
+    map2lio_.header.frame_id = "map";
+    map2lio_.header.stamp = ros::Time::now();
+    map2lio_.child_frame_id = "lio";
+    map2lio_.transform.rotation.w = 1;
+    tf_broadcaster_lio_.init(root_nh);
+    tf_broadcaster_lio_.sendTransform(map2odom_);
+  }
 
   // init odom tf
   if (enable_odom_tf_)
@@ -104,7 +119,7 @@ bool ChassisBase<T...>::init(hardware_interface::RobotHW* robot_hw, ros::NodeHan
     tf_broadcaster_.init(root_nh);
     tf_broadcaster_.sendTransform(odom2base_);
   }
-  world2odom_.setRotation(tf2::Quaternion::getIdentity());
+  camera_init2odom_.setRotation(tf2::Quaternion::getIdentity());
 
   outside_odom_sub_ =
       controller_nh.subscribe<nav_msgs::Odometry>("/odometry", 10, &ChassisBase::outsideOdomCallback, this);
@@ -115,8 +130,6 @@ bool ChassisBase<T...>::init(hardware_interface::RobotHW* robot_hw, ros::NodeHan
   if (controller_nh.hasParam("pid_follow"))
     if (!pid_follow_.init(ros::NodeHandle(controller_nh, "pid_follow")))
       return false;
-
-  path_pub_ = controller_nh.advertise<nav_msgs::Path>("/ori_path", 10);
 
   return true;
 }
@@ -310,21 +323,19 @@ void ChassisBase<T...>::updateOdom(const ros::Time& time, const ros::Duration& p
 
   if (topic_update_)
   {
-    auto* odom_msg = odom_buffer_.readFromRT();
-
-    tf2::Transform world2sensor;
-    world2sensor.setOrigin(
-        tf2::Vector3(odom_msg->pose.pose.position.x, odom_msg->pose.pose.position.y, odom_msg->pose.pose.position.z));
-    world2sensor.setRotation(tf2::Quaternion(odom_msg->pose.pose.orientation.x, odom_msg->pose.pose.orientation.y,
-                                             odom_msg->pose.pose.orientation.z, odom_msg->pose.pose.orientation.w));
-
-    if (world2odom_.getRotation() == tf2::Quaternion::getIdentity())  // First received
+    auto* lio_msg = odom_buffer_.readFromRT();
+    tf2::Transform camera_init2body;
+    camera_init2body.setOrigin(
+        tf2::Vector3(lio_msg->pose.pose.position.x, lio_msg->pose.pose.position.y, lio_msg->pose.pose.position.z));
+    camera_init2body.setRotation(tf2::Quaternion(lio_msg->pose.pose.orientation.x, lio_msg->pose.pose.orientation.y,
+                                                 lio_msg->pose.pose.orientation.z, lio_msg->pose.pose.orientation.w));
+    if (camera_init2odom_.getRotation() == tf2::Quaternion::getIdentity())
     {
       tf2::Transform odom2sensor;
       try
       {
         geometry_msgs::TransformStamped tf_msg =
-            robot_state_handle_.lookupTransform("odom", "livox_frame", odom_msg->header.stamp);
+            robot_state_handle_.lookupTransform("odom", "livox_frame", lio_msg->header.stamp);
         tf2::fromMsg(tf_msg.transform, odom2sensor);
       }
       catch (tf2::TransformException& ex)
@@ -332,13 +343,13 @@ void ChassisBase<T...>::updateOdom(const ros::Time& time, const ros::Duration& p
         ROS_WARN("%s", ex.what());
         return;
       }
-      world2odom_ = world2sensor * odom2sensor.inverse();
+      camera_init2odom_ = camera_init2body * odom2sensor.inverse();
     }
     tf2::Transform base2sensor;
     try
     {
       geometry_msgs::TransformStamped tf_msg =
-          robot_state_handle_.lookupTransform("base_link", "livox_frame", odom_msg->header.stamp);
+          robot_state_handle_.lookupTransform("base_link", "livox_frame", lio_msg->header.stamp);
       tf2::fromMsg(tf_msg.transform, base2sensor);
     }
     catch (tf2::TransformException& ex)
@@ -346,35 +357,26 @@ void ChassisBase<T...>::updateOdom(const ros::Time& time, const ros::Duration& p
       ROS_WARN("%s", ex.what());
       return;
     }
-    tf2::Transform odom2base = world2odom_.inverse() * world2sensor * base2sensor.inverse();
-    odom2base_.transform.translation.x = odom2base.getOrigin().x();
-    odom2base_.transform.translation.y = odom2base.getOrigin().y();
-    odom2base_.transform.translation.z = odom2base.getOrigin().z();
-    topic_update_ = false;
-  }
-
-  if (enable_path_)
-  {
-    path_.header.stamp = time;
-    path_.header.frame_id = "odom";
-    geometry_msgs::PoseStamped this_pose_stamped;
-    this_pose_stamped.header.frame_id = "odom";
-    this_pose_stamped.header.stamp = time;
-    this_pose_stamped.pose.position.x = odom2base_.transform.translation.x;
-    this_pose_stamped.pose.position.y = odom2base_.transform.translation.y;
-    this_pose_stamped.pose.position.z = odom2base_.transform.translation.z;
-    this_pose_stamped.pose.orientation.x = odom2base_.transform.rotation.x;
-    this_pose_stamped.pose.orientation.y = odom2base_.transform.rotation.y;
-    this_pose_stamped.pose.orientation.z = odom2base_.transform.rotation.z;
-    this_pose_stamped.pose.orientation.w = odom2base_.transform.rotation.w;
-
-    double path_publish_rate = 1.0;
-    if (path_publish_rate > 0.0 && last_path_publish_time_ + ros::Duration(1.0 / path_publish_rate) < time)
+    tf2::Transform odom2lio_base = camera_init2odom_.inverse() * camera_init2body * base2sensor.inverse();
+    map2lio_.transform = tf2::toMsg(odom2lio_base);
+    //    tf2::Transform map2odom;
+    tf2::Transform odom2wheel_base;
+    try
     {
-      path_.poses.push_back(this_pose_stamped);
-      path_pub_.publish(path_);  // path
-      last_path_publish_time_ = time;
+      geometry_msgs::TransformStamped tf_msg =
+          robot_state_handle_.lookupTransform("odom", "base_link", lio_msg->header.stamp);
+      tf2::fromMsg(tf_msg.transform, odom2wheel_base);
     }
+    catch (tf2::TransformException& ex)
+    {
+      ROS_WARN("%s", ex.what());
+      return;
+    }
+    // tf2::fromMsg(odom2base_.transform, odom2wheel_base);
+    tf2::Transform wheel_base2lio_base = odom2lio_base * odom2wheel_base.inverse();
+    map2odom_.transform = tf2::toMsg(wheel_base2lio_base);
+    //    robot_state_handle_.setTransform(map2odom_, "rm_chassis_controllers");
+    topic_update_ = false;
   }
 
   robot_state_handle_.setTransform(odom2base_, "rm_chassis_controllers");
@@ -390,7 +392,16 @@ void ChassisBase<T...>::updateOdom(const ros::Time& time, const ros::Duration& p
       odom_pub_->unlockAndPublish();
     }
     if (enable_odom_tf_ && publish_odom_tf_)
+    {
+      if (enable_map_tf_)
+      {
+        map2lio_.header.stamp = time;
+        map2odom_.header.stamp = time;
+        tf_broadcaster_map2odom_.sendTransform(map2odom_);
+        tf_broadcaster_lio_.sendTransform(map2lio_);
+      }
       tf_broadcaster_.sendTransform(odom2base_);
+    }
     last_publish_time_ = time;
   }
 }
